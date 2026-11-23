@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets
+.env
+secrets.toml
+
+# Local database
+*.db
+*.sqlite3
+
+# Temporary files
+*.log
+.DS_Store
