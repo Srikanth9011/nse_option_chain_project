@@ -16,7 +16,7 @@ RATE = 0.065
 def demo_expiries(n=5):
     d, out = datetime.now().date(), []
     while len(out) < n:
-        if d.weekday() == 1:  # Tuesday
+        if d.weekday() == 1 and datetime.now() < datetime.combine(d, datetime.min.time()).replace(hour=15, minute=30):  # Tuesday, not yet expired
             out.append(d.strftime("%d-%b-%Y"))
         d += timedelta(days=1)
     return out
