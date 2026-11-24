@@ -13,7 +13,7 @@ from nse_option_chain import extract_spot, fetch_expiries, fetch_option_chain
 
 st.set_page_config(page_title="NSE Options · Paper Trading", page_icon="📈", layout="wide")
 
-INDEXES = {"NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60,"MIDCPNIFTY": 120, "HDFCBANK":500}  # default lot sizes - editable in sidebar
+INDEXES = {"NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60}  # default lot sizes - editable in sidebar
 GREEN, RED, AMBER = "#0e9f6e", "#e5484d", "#f5a524"
 ss = st.session_state
 
@@ -86,7 +86,7 @@ def get_expiries(symbol, demo, force=False):
         lst = demo_data.demo_expiries()
     else:
         try:
-            lst = fetch_expiries(symbol)
+            lst = [e for e in fetch_expiries(symbol) if not paper.is_expired(e)]
         except Exception:
             lst = []
     ss.expiries[key] = {"list": lst, "t": time.time()}
@@ -106,10 +106,11 @@ def load_market(demo, symbol, expiry):
             chain, payload = fetch_option_chain(symbol, expiry)
             spot = extract_spot(payload, chain)
         ss.chain, ss.spot, ss.fetched_at, ss.error = chain, spot, datetime.now(), None
-        for r in chain[["STRIKE", "CE LTP", "PE LTP"]].itertuples(index=False):
-            for typ, v in (("CE", r[1]), ("PE", r[2])):
-                if pd.notna(v):
-                    ss.marks[(symbol, expiry, typ, float(r[0]))] = float(v)
+        rows = [(typ, float(r[0]), float(v)) for r in chain[["STRIKE", "CE LTP", "PE LTP"]].itertuples(index=False)
+                for typ, v in (("CE", r[1]), ("PE", r[2])) if pd.notna(v)]
+        for typ, k, v in rows:
+            ss.marks[(symbol, expiry, typ, k)] = v
+        paper.save_market(symbol, expiry, spot, rows)
     except Exception as exc:
         ss.error = str(exc)
 
@@ -131,12 +132,15 @@ with st.sidebar:
     st.markdown("### 📈 NSE Options")
     source = st.radio("Data source", ["Live NSE", "Demo (simulated)"], help="Demo works anytime - great for practice when the market is closed or NSE blocks requests.")
     demo = source.startswith("Demo")
+    paper.set_mode(demo)
+    if ss.get("ledger_mode") != demo:  # switching Live/Demo switches to that account's saved prices and history
+        ss.ledger_mode, ss.marks, ss.chain, ss.spot, ss.sel = demo, paper.load_marks(), pd.DataFrame(), None, None
     symbol = st.selectbox("Index", list(INDEXES))
     expiries = get_expiries(symbol, demo)
     if expiries:
         expiry = st.selectbox("Expiry", expiries)
     else:
-        expiry = st.text_input("Expiry (DD-Mon-YYYY)", "24-Nov-2026", help="Couldn't load the expiry list from NSE - type one manually.")
+        expiry = st.text_input("Expiry (DD-Mon-YYYY)", demo_data.demo_expiries()[0], help="Couldn't load the expiry list from NSE - type one manually.")
     refresh = st.button("🔄 Refresh now", type="primary")
     if refresh:
         get_expiries(symbol, demo, force=True)
@@ -157,7 +161,11 @@ if expiry and (ss.sel != (demo, symbol, expiry) or refresh or (auto and not dial
         load_market(demo, symbol, expiry)
 
 orders = paper.load_orders()
-positions, events = paper.build_positions(orders, ss.marks)
+positions, events = paper.build_positions(orders, {**paper.load_marks(), **ss.marks})
+if paper.auto_settle(positions, paper.load_spots()):
+    st.toast("Expired contracts were settled at intrinsic value", icon="🏁")
+    orders = paper.load_orders()
+    positions, events = paper.build_positions(orders, {**paper.load_marks(), **ss.marks})
 auto_exits = paper.check_brackets(positions, paper.load_brackets())
 for p, status in auto_exits:
     side = "SELL" if p["Net Qty"] > 0 else "BUY"
@@ -165,7 +173,7 @@ for p, status in auto_exits:
     st.toast(f"{status}: {p['Index']} {p['Strike']:g} {p['Type']} closed at {inr(p['LTP'])}", icon="🎯" if status == "TARGET HIT" else "🛑")
 if auto_exits:
     orders = paper.load_orders()
-    positions, events = paper.build_positions(orders, ss.marks)
+    positions, events = paper.build_positions(orders, {**paper.load_marks(), **ss.marks})
 brackets = paper.load_brackets()
 
 realized = positions["Realized"].sum() if not positions.empty else 0.0
@@ -226,7 +234,7 @@ def open_trade(sym, exp, typ, strike, ltp, side="BUY"):
 
 
 def positions_panel(key):
-    open_pos = positions[positions["Net Qty"] != 0] if not positions.empty else positions
+    open_pos = positions[(positions["Net Qty"] != 0) & ~positions["Expired"]] if not positions.empty else positions
     if open_pos.empty:
         st.info("No open positions yet. Click any price in the option chain to place a trade.")
         return
@@ -284,9 +292,37 @@ m = st.columns(5)
 m[0].metric("Realized", inr(realized, signed=True))
 m[1].metric("Unrealized", inr(unreal, signed=True))
 m[2].metric("Win rate", f"{stats['win']:.0f}%" if stats["win"] is not None else "—", f"{stats['n']} closed trades", delta_color="off")
-m[3].metric("Open positions", int((positions["Net Qty"] != 0).sum()) if not positions.empty else 0)
+m[3].metric("Open positions", int(((positions["Net Qty"] != 0) & ~positions["Expired"]).sum()) if not positions.empty else 0)
 m[4].metric("PCR (OI)", f"{cs['pcr']:.2f}" if cs and cs["pcr"] else "—",
             f"Max pain {cs['maxpain']:,.0f}" if cs else None, delta_color="off")
+
+def settlement_box():
+    """Expired contracts still open in the ledger: confirm the official settlement value and book the P&L."""
+    if positions.empty:
+        return
+    pend = positions[(positions["Net Qty"] != 0) & positions["Expired"]]
+    if pend.empty:
+        return
+    spots = paper.load_spots()
+    with st.container(border=True):
+        st.warning(f"{len(pend)} expired contract(s) need settling. Index options are cash-settled at intrinsic value on the expiry-day closing index value.")
+        for (idx, exp), g in pend.groupby(["Index", "Expiry"]):
+            last = spots.get((idx, exp))
+            default = last[0] if last else (ss.spot if ss.spot and idx == symbol else 0.0)
+            c1, c2 = st.columns([1, 2])
+            sp = c1.number_input(f"{idx} settlement value · {exp}", 0.0, 1e7, float(default), 0.05, format="%.2f", key=f"set_{idx}_{exp}")
+            est = sum((paper.settle_price(r["Type"], r["Strike"], sp) - r["Avg"]) * r["Net Qty"] for r in g.to_dict("records"))
+            c2.caption((f"Last index value seen for this expiry: {last[0]:,.2f} ({last[1].replace('T', ' ')}). " if last else
+                        "No index value was recorded for this expiry - enter the official closing value. ")
+                       + f"Contracts: {', '.join(f'{r.Strike:g} {r.Type}' for r in g.itertuples())}. Estimated P&L: {inr(est, signed=True)}")
+            if c2.button(f"Settle {idx} {exp}", key=f"setbtn_{idx}_{exp}", disabled=sp <= 0):
+                for r in g.to_dict("records"):
+                    paper.settle_position(r, sp)
+                st.toast(f"Settled {len(g)} contract(s) at {sp:,.2f}", icon="🏁")
+                st.rerun()
+
+
+settlement_box()
 
 page = st.segmented_control("Page", ["📈 Trade", "💰 P&L dashboard", "📒 Orders", "🔬 Market"], default="📈 Trade",
                             key="page", label_visibility="collapsed") or "📈 Trade"
@@ -368,7 +404,7 @@ def page_pnl():
     with p1:
         positions_panel("pnl")
     with p2:
-        mine = [p for p in positions[positions["Net Qty"] != 0].to_dict("records")
+        mine = [p for p in positions[(positions["Net Qty"] != 0) & ~positions["Expired"]].to_dict("records")
                 if p["Index"] == symbol and p["Expiry"] == expiry] if not positions.empty else []
         if not mine or not live_ok:
             st.info(f"Payoff chart appears when you hold {symbol} {expiry} options.")
@@ -396,10 +432,14 @@ def page_orders():
     if orders.empty:
         st.info("Executed paper orders will appear here.")
     else:
-        f1, f2 = st.columns(2)
+        f0, f1, f2 = st.columns(3)
         sides = f1.multiselect("Side", ["BUY", "SELL"], ["BUY", "SELL"])
         stat = f2.multiselect("Status", sorted(orders["status"].unique()), sorted(orders["status"].unique()))
+        show = f0.radio("Contracts", ["All", "Active", "Expired"], horizontal=True)
         v = orders[orders["side"].isin(sides) & orders["status"].isin(stat)].copy()
+        if show != "All":
+            v = v[v["expiry"].map(paper.is_expired) == (show == "Expired")]
+        v["Contract"] = v["expiry"].map(lambda e: "Expired" if paper.is_expired(e) else "Active")
         v["order_time"] = pd.to_datetime(v["order_time"]).dt.strftime("%d-%b %H:%M:%S")
         st.dataframe(v.rename(columns={"order_time": "Time", "symbol": "Index", "expiry": "Expiry", "option_type": "Type",
                                        "strike": "Strike", "side": "Side", "quantity": "Qty", "price": "Price", "status": "Status"}),
