@@ -1,4 +1,4 @@
-# NSE Option Chain — Paper Trading Dashboard (v2)
+# NSE Option Chain — Paper Trading Dashboard 
 
 Streamlit dashboard: live NSE option chain + simulated Buy/Sell with a real-time Profit/Loss dashboard.
 **Paper trading only — no orders are sent to any broker.**
