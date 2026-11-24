@@ -8,7 +8,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-DB_PATH = Path(os.environ.get("PAPER_DB", Path(__file__).with_name("paper_trading.db")))
+BASE_DB = Path(os.environ.get("PAPER_DB", Path(__file__).with_name("paper_trading.db")))
+DB_PATH = BASE_DB
+
+
+def set_mode(demo):
+    """Live and Demo trades live in separate database files so simulated prices never touch real-data history."""
+    global DB_PATH
+    DB_PATH = BASE_DB.with_name(BASE_DB.stem + "_demo" + BASE_DB.suffix) if demo else BASE_DB
 
 SCHEMA = [
     """CREATE TABLE IF NOT EXISTS orders (
@@ -19,7 +26,61 @@ SCHEMA = [
         symbol TEXT, expiry TEXT, option_type TEXT, strike REAL, sl REAL, target REAL,
         PRIMARY KEY (symbol, expiry, option_type, strike))""",
     "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)",
+    """CREATE TABLE IF NOT EXISTS marks (
+        symbol TEXT, expiry TEXT, option_type TEXT, strike REAL, ltp REAL, ts TEXT,
+        PRIMARY KEY (symbol, expiry, option_type, strike))""",
+    "CREATE TABLE IF NOT EXISTS spots (symbol TEXT, expiry TEXT, spot REAL, ts TEXT, PRIMARY KEY (symbol, expiry))",
 ]
+
+
+def is_expired(expiry, now=None):
+    """Index options stop trading at 15:30 IST on expiry day."""
+    try:
+        return datetime.strptime(expiry, "%d-%b-%Y").replace(hour=15, minute=30) < (now or datetime.now())
+    except ValueError:
+        return False
+
+
+def save_market(symbol, expiry, spot, rows):
+    """Persist last seen prices (rows = [(type, strike, ltp)]) and spot so P&L and expiry settlement survive restarts."""
+    ts = datetime.now().isoformat(timespec="seconds")
+    with closing(sqlite3.connect(DB_PATH)) as c:
+        for s in SCHEMA:
+            c.execute(s)
+        c.executemany("INSERT OR REPLACE INTO marks VALUES (?,?,?,?,?,?)",
+                      [(symbol, expiry, t, float(k), float(v), ts) for t, k, v in rows])
+        c.execute("INSERT OR REPLACE INTO spots VALUES (?,?,?,?)", (symbol, expiry, float(spot), ts))
+        c.commit()
+
+
+def load_marks():
+    return {(r[0], r[1], r[2], float(r[3])): r[4] for r in _run("SELECT symbol, expiry, option_type, strike, ltp FROM marks", fetch=True)}
+
+
+def load_spots():
+    return {(r[0], r[1]): (r[2], r[3]) for r in _run("SELECT symbol, expiry, spot, ts FROM spots", fetch=True)}
+
+
+def settle_price(option_type, strike, spot):
+    """Index options are cash-settled at intrinsic value."""
+    return max(spot - strike, 0.0) if option_type == "CE" else max(strike - spot, 0.0)
+
+
+def settle_position(p, spot):
+    side = "SELL" if p["Net Qty"] > 0 else "BUY"
+    place_order(p["Index"], p["Expiry"], p["Type"], p["Strike"], side, abs(p["Net Qty"]),
+                settle_price(p["Type"], p["Strike"], spot), status="EXPIRED")
+
+
+def auto_settle(positions, spots):
+    """Settle expired positions when the last recorded spot was captured on expiry day. Returns number settled."""
+    n = 0
+    for p in positions[(positions["Net Qty"] != 0) & positions["Expired"]].to_dict("records"):
+        sp = spots.get((p["Index"], p["Expiry"]))
+        if sp and sp[1][:10] == datetime.strptime(p["Expiry"], "%d-%b-%Y").date().isoformat():
+            settle_position(p, sp[0])
+            n += 1
+    return n
 
 
 def _run(sql, params=(), fetch=False):
@@ -85,7 +146,7 @@ def place_order(symbol, expiry, otype, strike, side, qty, price, status="EXECUTE
 # ------------------------------ P&L engine ------------------------------
 def build_positions(orders, marks):
     """Replay the order ledger. Returns (positions_df, closed_trade_events_df)."""
-    cols = ["Index", "Expiry", "Type", "Strike", "Net Qty", "Avg", "LTP", "Realized", "Unrealized", "Total"]
+    cols = ["Index", "Expiry", "Type", "Strike", "Net Qty", "Avg", "LTP", "Realized", "Unrealized", "Total", "Expired"]
     if orders.empty:
         return pd.DataFrame(columns=cols), pd.DataFrame(columns=["time", "label", "pnl"])
     states, events = {}, []
@@ -112,9 +173,10 @@ def build_positions(orders, marks):
     rows = []
     for (sym, exp, typ, k), st in states.items():
         ltp = marks.get((sym, exp, typ, k))
-        unreal = (ltp - st["avg"]) * st["q"] if (ltp is not None and st["q"]) else (0.0 if st["q"] == 0 else None)
+        expired = is_expired(exp)
+        unreal = (ltp - st["avg"]) * st["q"] if (ltp is not None and st["q"] and not expired) else (0.0 if st["q"] == 0 else None)
         rows.append([sym, exp, typ, k, st["q"], st["avg"], ltp, st["real"], unreal,
-                     st["real"] + (unreal or 0.0)])
+                     st["real"] + (unreal or 0.0), expired])
     pos = pd.DataFrame(rows, columns=cols).sort_values(["Index", "Expiry", "Strike", "Type"]).reset_index(drop=True)
     return pos, pd.DataFrame(events, columns=["time", "label", "pnl"])
 
@@ -124,7 +186,7 @@ def check_brackets(positions, brackets):
     hits = []
     for p in positions[positions["Net Qty"] != 0].to_dict("records"):
         b = brackets.get((p["Index"], p["Expiry"], p["Type"], float(p["Strike"])))
-        if not b or p["LTP"] is None or pd.isna(p["LTP"]):
+        if not b or p["LTP"] is None or pd.isna(p["LTP"]) or p["Expired"]:
             continue
         sl, tg = b
         long_ = p["Net Qty"] > 0
