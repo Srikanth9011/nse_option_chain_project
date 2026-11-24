@@ -13,7 +13,7 @@ from nse_option_chain import extract_spot, fetch_expiries, fetch_option_chain
 
 st.set_page_config(page_title="NSE Options · Paper Trading", page_icon="📈", layout="wide")
 
-INDEXES = {"NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60}  # default lot sizes - editable in sidebar
+INDEXES = {"NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60,"MIDCPNIFTY": 120, "HDFCBANK":500}  # default lot sizes - editable in sidebar
 GREEN, RED, AMBER = "#0e9f6e", "#e5484d", "#f5a524"
 ss = st.session_state
 
